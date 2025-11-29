@@ -1,6 +1,202 @@
-yokchang defense 
+/*
+ * 스마트 욕창 방지 매트리스 - 노이즈 제거 (이동 평균 필터)
+ *
+ * [개선 사항]
+ * - 최근 10개 센서 값을 저장하여 '평균값'으로 제어 (노이즈로 인한 오작동 방지)
+ * - 시리얼 모니터에는 '실시간 값'과 '평균 값'을 모두 표시
+ *
+ * [동작]
+ * 1. 펌프: '평균 압력'이 2.93 미만이면 작동
+ * 2. 밸브: '평균 압력'이 3.33 초과시 열림 (히스테리시스 적용)
+ */
 
-4개 가지 테스트
-추가 생성
-야저야ㅐ저ㅑㅐㅇ버ㅐㅑㅈ
-hi zz
+#include <Wire.h>
+#include <XGZP6897D.h>
+
+// --- 1. 설정값 ---
+#define PUMP_ON_THRESHOLD   2.93  // 펌프 켜는 기준 (평균값 기준)
+#define VENT_OPEN_THRESHOLD 3.33  // 밸브 여는 기준 (평균값 기준)
+#define VENT_CLOSE_THRESHOLD 3.20 // 밸브 닫는 기준 (평균값 기준)
+
+#define SENSOR_COUNT        3
+#define AVG_COUNT           10    // 평균 낼 샘플 개수 (10개)
+
+#define K 512 
+XGZP6897D mysensor(K);
+
+// --- 2. 핀 매핑 ---
+const int PUMP_PIN = 2;
+const uint8_t SENSOR_CHS[SENSOR_COUNT] = {5, 6, 7};
+const int VALVE_PINS[SENSOR_COUNT]     = {34, 32, 30}; 
+
+// --- 3. 변수 ---
+float raw_pressures[SENSOR_COUNT];      // 실시간 센서 값 (Raw)
+float avg_pressures[SENSOR_COUNT];      // 평균 센서 값 (Filtered)
+float offsets_pa[SENSOR_COUNT] = {0.0}; 
+float temperature_c;
+
+// 이동 평균을 위한 버퍼 (2차원 배열: [센서번호][샘플번호])
+float pressure_history[SENSOR_COUNT][AVG_COUNT]; 
+int history_index = 0; // 현재 저장할 배열 인덱스
+
+bool isVenting[SENSOR_COUNT] = {false}; 
+unsigned long lastSensorReadTime = 0;
+
+// --- 함수 프로토타입 ---
+void tcaSelect(uint8_t channel);
+void setupAllSensors();
+void readAllSensors();
+void calculateAverage(); // 평균 계산 함수 추가
+void controlLogic();
+void printStatus();
+
+
+// --- 4. 멀티플렉서 선택 ---
+void tcaSelect(uint8_t channel) {
+  if (channel > 7) return;
+  Wire.beginTransmission(0x70);
+  Wire.write(1 << channel);
+  Wire.endTransmission();
+}
+
+void setup() {
+  Serial.begin(9600);
+  Wire.begin();
+
+  pinMode(PUMP_PIN, OUTPUT);
+  for (int i = 0; i < SENSOR_COUNT; i++) {
+    pinMode(VALVE_PINS[i], OUTPUT);
+    digitalWrite(VALVE_PINS[i], LOW);
+  }
+  digitalWrite(PUMP_PIN, LOW);
+
+  Serial.println("--- 노이즈 필터(이동평균 10개) 제어 시작 ---");
+  
+  // 1. 초기 배출 (10초)
+  Serial.println(">>> [초기화] 잔여 공기 배출 (10초)...");
+  for(int i=0; i<SENSOR_COUNT; i++) digitalWrite(VALVE_PINS[i], HIGH);
+  delay(10000);
+  for(int i=0; i<SENSOR_COUNT; i++) digitalWrite(VALVE_PINS[i], LOW);
+
+  // 2. 영점 잡기 및 버퍼 초기화
+  setupAllSensors();
+}
+
+void loop() {
+  if (millis() - lastSensorReadTime >= 100) { // 0.1초 간격
+    lastSensorReadTime = millis();
+    
+    readAllSensors();   // 1. 값 읽기 (Raw 업데이트)
+    calculateAverage(); // 2. 평균 계산 (Avg 업데이트)
+    controlLogic();     // 3. 제어 (Avg 기준)
+    printStatus();      // 4. 출력
+  }
+}
+
+// --- [신규] 평균 계산 함수 ---
+void calculateAverage() {
+  // 1. 현재 Raw 값을 히스토리 버퍼에 저장
+  for (int i = 0; i < SENSOR_COUNT; i++) {
+    pressure_history[i][history_index] = raw_pressures[i];
+  }
+
+  // 2. 인덱스 이동 (0~9 반복)
+  history_index++;
+  if (history_index >= AVG_COUNT) {
+    history_index = 0;
+  }
+
+  // 3. 각 센서별 평균 계산
+  for (int i = 0; i < SENSOR_COUNT; i++) {
+    float sum = 0.0;
+    for (int j = 0; j < AVG_COUNT; j++) {
+      sum += pressure_history[i][j];
+    }
+    avg_pressures[i] = sum / AVG_COUNT;
+  }
+}
+
+// --- [수정] 제어 로직 (avg_pressures 사용) ---
+void controlLogic() {
+  
+  // 1. 펌프 제어 (평균값 기준)
+  bool needInflation = false;
+  for (int i = 0; i < SENSOR_COUNT; i++) {
+    if (avg_pressures[i] < PUMP_ON_THRESHOLD) {
+      needInflation = true;
+      break; 
+    }
+  }
+
+  if (needInflation) {
+    digitalWrite(PUMP_PIN, HIGH); 
+  } else {
+    digitalWrite(PUMP_PIN, LOW);  
+  }
+
+  // 2. 밸브 제어 (평균값 기준)
+  for (int i = 0; i < SENSOR_COUNT; i++) {
+    float p = avg_pressures[i]; // 제어는 평균값으로!
+
+    if (p > VENT_OPEN_THRESHOLD) {
+      isVenting[i] = true; 
+    }
+    else if (p < VENT_CLOSE_THRESHOLD) {
+      isVenting[i] = false; 
+    }
+    
+    if (isVenting[i]) digitalWrite(VALVE_PINS[i], HIGH);
+    else digitalWrite(VALVE_PINS[i], LOW);
+  }
+}
+
+// --- 보조 함수들 ---
+
+void readAllSensors() {
+  for (int i = 0; i < SENSOR_COUNT; i++) {
+    tcaSelect(SENSOR_CHS[i]); 
+    float p_pa;
+    if (mysensor.readSensor(temperature_c, p_pa)) {
+      raw_pressures[i] = (p_pa - offsets_pa[i]) / 1000.0;
+    }
+  }
+}
+
+void printStatus() {
+  Serial.print("[PUMP:");
+  Serial.print(digitalRead(PUMP_PIN) ? "ON] " : "OFF] ");
+  
+  for (int i = 0; i < SENSOR_COUNT; i++) {
+    Serial.print("S"); Serial.print(i+1);
+    // 보기 좋게 '평균값'을 메인으로 출력하고 (실시간값)은 괄호 안에 표시
+    Serial.print(" Avg:"); Serial.print(avg_pressures[i], 2);
+    Serial.print("("); Serial.print(raw_pressures[i], 2); Serial.print(") ");
+    
+    if (isVenting[i]) Serial.print("[Open] ");
+    else Serial.print("       ");
+  }
+  Serial.println();
+}
+
+void setupAllSensors() {
+  Serial.println("영점 잡는 중...");
+  delay(1000);
+
+  for (int i = 0; i < SENSOR_COUNT; i++) {
+    tcaSelect(SENSOR_CHS[i]); 
+    delay(10);
+    if(mysensor.begin()) {
+       float p;
+       mysensor.readSensor(temperature_c, p);
+       offsets_pa[i] = p;
+       
+       // [중요] 필터 배열 초기화 (처음엔 모두 0.0으로 채우면 평균 깎이므로 현재 값으로 채움)
+       for(int j=0; j<AVG_COUNT; j++) {
+         pressure_history[i][j] = 0.0; // 0으로 시작 (어차피 금방 채워짐)
+       }
+    } else {
+       Serial.println("센서 연결 실패!");
+    }
+  }
+  Serial.println("설정 완료.");
+}
